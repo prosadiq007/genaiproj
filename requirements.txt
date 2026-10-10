@@ -1,5 +1,7 @@
 streamlit
 groq
 pypdf
+python-docx
 chromadb
 pandas
+openpyxl
