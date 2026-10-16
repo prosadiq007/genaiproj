@@ -1,5 +1,13 @@
+import io
+import mimetypes
 import os
+import re
+import smtplib
+import ssl
 import time
+import uuid
+from email.message import EmailMessage
+from xml.sax.saxutils import escape
 from itertools import chain
 
 import chromadb
@@ -7,6 +15,9 @@ import pandas as pd
 import streamlit as st
 from groq import Groq
 from pypdf import PdfReader
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 # ============================================================
 # INTELLICHAT: DOCUMENT-AWARE AI ASSISTANT
@@ -134,6 +145,18 @@ def get_chroma_client():
     return chromadb.EphemeralClient()
 
 
+def collection_name():
+    """One collection per browser session, so users never see each other's files."""
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = uuid.uuid4().hex[:12]
+    return f"docs_{st.session_state.session_id}"
+
+
+def contains_keyword(text, keyword):
+    """Whole-word, case-insensitive match, so '5' does not match '2015'."""
+    return re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", text, re.IGNORECASE) is not None
+
+
 def extract_pages(f):
     """Return a list of (page_number, text) for pdf, docx, txt or md files."""
     name = f.name.lower()
@@ -173,11 +196,12 @@ def chunk_text(text, size, overlap):
 def build_index(files, chunk_size, overlap):
     """Index every file. Returns (info, pages_by_file, chunk_count)."""
     client = get_chroma_client()
+    name = collection_name()
     try:
-        client.delete_collection("docs")
+        client.delete_collection(name)
     except Exception:
         pass
-    collection = client.create_collection("docs")
+    collection = client.create_collection(name)
 
     ids, docs, metas, info, pages_by_file = [], [], [], [], {}
 
@@ -206,7 +230,7 @@ def build_index(files, chunk_size, overlap):
 
 
 def retrieve(query, k):
-    collection = get_chroma_client().get_collection("docs")
+    collection = get_chroma_client().get_collection(collection_name())
     k = max(1, min(k, collection.count()))
     res = collection.query(query_texts=[query], n_results=k)
     return [
@@ -253,7 +277,8 @@ def route(client, question, history, mode, k, temperature, reasoning):
                 if len(head) >= 16:
                     break
 
-            if not head.strip().upper().startswith("NOT_IN_DOC"):
+            cleaned = head.strip().lstrip("*#_`\"' \n\t").upper()
+            if not cleaned.startswith("NOT_IN_DOC"):
                 return chain(buffered, stream), chunks, "📄 From your documents"
 
             if mode == "Documents only":
@@ -310,6 +335,55 @@ def render_message(msg):
                     st.caption(s["text"])
 
 
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+MAX_RECIPIENTS = 5
+
+
+MAX_ATTACH_BYTES = 20 * 1024 * 1024  # stay under typical provider limits (Gmail: 25 MB)
+
+
+def make_pdf(title, body):
+    """Render plain text as a PDF and return its bytes."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, title=title)
+    styles = getSampleStyleSheet()
+    story = [Paragraph(escape(title), styles["Title"]), Spacer(1, 12)]
+    for para in body.split("\n\n"):
+        if para.strip():
+            story.append(Paragraph(escape(para).replace("\n", "<br/>"), styles["BodyText"]))
+            story.append(Spacer(1, 6))
+    doc.build(story)
+    return buf.getvalue()
+
+
+def send_email(recipients, subject, body, attachments):
+    """Send one message to user-entered recipients via the user's own SMTP account.
+    attachments: list of (filename, bytes)."""
+    host = os.getenv("SMTP_HOST")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    user = os.getenv("SMTP_USER")
+    password = os.getenv("SMTP_PASSWORD")
+    sender = os.getenv("SMTP_FROM", user)
+    if not all([host, user, password, sender]):
+        raise RuntimeError("Email is not configured. Set SMTP_HOST, SMTP_USER and "
+                           "SMTP_PASSWORD (optionally SMTP_PORT and SMTP_FROM).")
+
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = subject
+    msg.set_content(body)
+    for name, data in attachments:
+        mime, _ = mimetypes.guess_type(name)
+        maintype, subtype = (mime or "application/octet-stream").split("/", 1)
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
+
+    with smtplib.SMTP(host, port, timeout=30) as server:
+        server.starttls(context=ssl.create_default_context())
+        server.login(user, password)
+        server.send_message(msg)
+
+
 def stat_card(icon, value, label):
     return (f'<div class="stat"><div class="stat-ic">{icon}</div>'
             f'<div><div class="stat-v">{value}</div>'
@@ -363,11 +437,51 @@ with st.sidebar:
 
                     st.session_state.chunk_count = count
                     st.session_state.docs_info = info
+                    st.session_state.uploaded_files = {f.name: f.getvalue() for f in uploaded}
                     st.session_state.suggestions = questions
                     st.session_state.messages = [{
                         "role": "assistant", "content": summary, "kind": "summary",
                         "label": "📋 Document summary", "time": time.time() - started,
                     }]
+
+    with st.expander("📧 Email a response"):
+        last_text = next((m["content"] for m in reversed(st.session_state.messages)
+                          if m["role"] == "assistant"), "")
+        to_raw = st.text_input("To (up to 5 addresses, comma separated)",
+                               placeholder="name@example.com")
+        subject = st.text_input("Subject", value="IntelliChat result")
+        body = st.text_area("Message", value=last_text, height=160,
+                            key=f"email_body_{len(st.session_state.messages)}")
+        stored = st.session_state.get("uploaded_files", {})
+        attach_docs = st.multiselect("Attach uploaded documents", options=list(stored.keys()))
+        attach_pdf = st.checkbox("Attach the message as a PDF", value=True)
+        if st.button("✉️ Send email", use_container_width=True):
+            recipients = [a.strip() for a in to_raw.split(",") if a.strip()]
+            if not recipients:
+                st.error("Enter at least one recipient.")
+            elif len(recipients) > MAX_RECIPIENTS:
+                st.error(f"Send to at most {MAX_RECIPIENTS} addresses at a time.")
+            elif bad := [r for r in recipients if not EMAIL_RE.match(r)]:
+                st.error(f"Invalid address: {', '.join(bad)}")
+            elif not body.strip():
+                st.error("The message is empty.")
+            else:
+                attachments = [(name, stored[name]) for name in attach_docs]
+                if attach_pdf:
+                    attachments.append(("IntelliChat_message.pdf",
+                                        make_pdf("IntelliChat message", body)))
+                total = sum(len(data) for _, data in attachments)
+                if total > MAX_ATTACH_BYTES:
+                    st.error("Attachments are over 20 MB. Remove some files and try again.")
+                else:
+                    try:
+                        send_email(recipients, subject.strip() or "IntelliChat result",
+                                   body, attachments)
+                        names = [n for n, _ in attachments]
+                        st.success(f"Sent to {', '.join(recipients)}"
+                                   + (f" with {', '.join(names)}" if names else ""))
+                    except Exception as e:
+                        st.error(f"Email failed: {e}")
 
     if st.button("🗑️ Clear chat", use_container_width=True):
         st.session_state.messages = []
@@ -497,7 +611,7 @@ else:
         for _, row in df.iterrows():
             question, keyword = str(row["question"]), str(row["expected_keyword"]).lower()
 
-            hits = [keyword in c["text"].lower() for c in retrieve(question, top_k)]
+            hits = [contains_keyword(c["text"], keyword) for c in retrieve(question, top_k)]
             first = hits.index(True) + 1 if any(hits) else None
 
             result = {
@@ -512,7 +626,7 @@ else:
                 stream, _, _ = route(client, question, [], "Documents only",
                                      top_k, temperature, reasoning)
                 answer = "".join(stream)
-                result["answer_correct"] = int(keyword in answer.lower())
+                result["answer_correct"] = int(contains_keyword(answer, keyword))
                 result["answer"] = answer
 
             rows.append(result)
