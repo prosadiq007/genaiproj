@@ -5,3 +5,4 @@ python-docx
 chromadb
 pandas
 openpyxl
+reportlab
